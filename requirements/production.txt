@@ -1,0 +1,4 @@
+-r base.txt
+
+psycopg>=3.2,<3.3
+gunicorn>=23,<24
