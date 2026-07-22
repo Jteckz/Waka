@@ -37,6 +37,8 @@ INSTALLED_APPS = [
     # Local
     "apps.accounts",
     "apps.networks",
+    "apps.geo",
+    "apps.agents",
 ]
 
 try:

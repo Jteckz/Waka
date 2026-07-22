@@ -6,6 +6,11 @@ class StandardCursorPagination(CursorPagination):
     page_size = 20
 
 
+class DistanceCursorPagination(CursorPagination):
+    ordering = "distance"
+    page_size = 20
+
+
 class StandardPageNumberPagination(PageNumberPagination):
     page_size = 20
     max_page_size = 100

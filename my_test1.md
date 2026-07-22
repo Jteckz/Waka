@@ -1,10 +1,10 @@
 # Wakala Connect — Project Documentation
 
-## What Has Been Implemented (Phases 1–5)
+## What Has Been Implemented (Phases 1–8)
 
 ### Phase 1: Project Scaffolding
 - Django project with `config/` package (settings split into `base.py`, `development.py`, `testing.py`, `production.py`)
-- PostgreSQL via `dj-database-url`, Redis cache/ Celery broker
+- PostgreSQL via `dj-database-url`, Redis cache / Celery broker
 - DRF + `djangorestframework-simplejwt` for API/auth
 - `django-cors-headers`, `drf-spectacular` (OpenAPI), `django-filter`, `django-fsm`, `django-simple-history`, `structlog`, `sentry-sdk`
 - `common/` library app with `BaseModel` (UUID pk + timestamps), `constants.py`, `exceptions.py`, `mixins.py`, `pagination.py`, `permissions.py`, `utils.py`, `validators.py`
@@ -34,17 +34,26 @@
   - `POST /login/refresh` — refresh token
   - `GET /me` — authenticated user profile
 - JWT: 15-min access + 1-day refresh with rotation + blacklisting
-- Tests: 3 test modules covering models, services, API (27 tests)
+- Tests: 3 test modules covering models, services, API
 
 ### Phase 5: RBAC Hardening
-- `common/permissions.py`: `IsMasterAgent`, `IsMinorAgent`, `IsAdminRole` + existing `IsOwnerOrReadOnly`
-- `apps/accounts/tests/factories.py`: `UserFactory` with role parameter + traits (`master`, `minor`, `admin`)
-- `common/tests/test_permissions.py`: Rewritten — parametrized tests with real `User` instances via `UserFactory` + `APIRequestFactory` + inline test views
-- `docs/architecture.md`: RBAC matrix documented
+- `common/permissions.py`:
+  - `IsMasterAgent` / `IsMinorAgent` — compare against `RoleChoices` enum values directly (no longer duck-typed)
+  - `IsAdminRole` added — checks `role == RoleChoices.ADMIN`
+  - `IsOwnerOrReadOnly` — unchanged object-level permission
+- `apps/accounts/tests/factories.py`: `UserFactory` (factory_boy `DjangoModelFactory`)
+  - Uses `create_user()` via custom `_create` override
+  - `phone` via `Sequence`, `password` via `make_password`, `role` as explicit parameter
+  - Traits: `.master` (MASTER_AGENT), `.minor` (MINOR_AGENT), `.admin` (ADMIN)
+  - No accounts-specific coupling — importable by any future app's tests
+- `common/tests/test_permissions.py`: Rewritten from mocks to real `User` instances
+  - Parametrized test covering all 9 `{IsMasterAgent, IsMinorAgent, IsAdminRole} × {MASTER_AGENT, MINOR_AGENT, ADMIN}` combinations
+  - Uses `APIRequestFactory` + `force_authenticate` + inline `_ProtectedView`
+- `docs/architecture.md`: RBAC matrix table with (endpoint category × role)
 
-### Phase 6 (Current): Networks App
-- `apps/networks/models.py`: `Network(BaseModel)` with `name` (unique, indexed), `logo` (URLField, blank), `network_type` (TextChoices: TELECOM/BANK), `is_active` (default True)
-  - **URLField chosen over ImageField** for MVP simplicity — avoids file upload, storage, and serving complexity
+### Phase 6: Networks App
+- `apps/networks/models.py`: `Network(BaseModel)` with `name` (unique, indexed), `logo` (URLField, blank), `network_type` (TELECOM/BANK), `is_active` (default True)
+  - **URLField chosen over ImageField** for MVP simplicity
 - Seed data migration (`0002_seed_networks.py`) — creates exactly 7 networks via `RunPython`:
   - **Telecom:** Airtel, Vodacom, Yas/Tigo, Halotel
   - **Bank:** CRDB, NMB, NBC
@@ -55,157 +64,123 @@
   - Cached for 15 minutes via `@cache_page`
 - Tests: 2 test modules covering models (str, uniqueness) and API (7 seeded networks, correct fields, no-auth, inactive filtering)
 
-### Total Test Count: **75 tests** — all passing
+### Phase 7: Geo App (Internal Geolocation)
+- `apps/geo/models.py`: `GeoLocatedModel` — abstract model with `latitude`/`longitude` FloatFields + `set_coordinates(lat, lng)` method
+  - **FloatField chosen over PointField** since GDAL is not available on all dev environments; production can migrate to PostGIS PointField
+- `apps/geo/utils.py`: `validate_latitude()` and `validate_longitude()` with range validation
+- `apps/geo/services.py`: Pure-Python distance calculations via `geopy`
+  - `calculate_distance_km(point_a, point_b) -> float`
+  - `is_within_radius(point_a, point_b, radius_km) -> bool`
+  - `validate_within_service_radius(origin, target, radius_km)` — raises `OutOfServiceRadiusError`
+- `apps/geo/selectors.py`: `nearby(queryset, point, radius_km) -> QuerySet`
+  - Uses haversine formula via Django ORM expressions (works on SQLite and PostgreSQL)
+  - Annotates `distance` in km, filters within radius, orders ascending
+- **No API endpoints** — pure internal capability consumed by other apps
+- Tests: coordinate validation, known-distance checks (Dar es Salaam ~4.2km), radius bounds, nearby filtering/ordering
+
+### Phase 8: Agents App (Business Logic)
+- **Models**:
+  - `MasterAgentProfile(BaseModel, GeoLocatedModel)`: OneToOne to User (PROTECT), `business_name` (indexed), `profile_photo` (URLField), `business_photos` (JSONField), `is_active` (indexed), `response_rate` (nullable Decimal)
+  - `MinorAgentProfile(BaseModel)`: OneToOne to User (PROTECT), `display_name` (optional)
+  - `AgentNetworkStatus(BaseModel)`: FK to MasterAgentProfile (CASCADE), FK to Network (PROTECT), `is_active` (indexed). UniqueConstraint on (master_agent, network)
+- **Services**:
+  - `create_master_agent_profile(user, business_name)` — validates user.role == MASTER_AGENT
+  - `create_minor_agent_profile(user)` — validates user.role == MINOR_AGENT
+  - `update_master_agent_location(profile, lat, lng)` — uses geo validation + `set_coordinates`
+  - `set_agent_active_status(profile, is_active)`
+  - `set_network_status(profile, network, is_active)` — get_or_create pattern
+- **Signal**: `post_save` on User auto-creates the appropriate profile on registration (chosen over service-call approach to avoid circular import between accounts and agents)
+- **Selectors**: `get_master_agent_profile(user)`, `get_minor_agent_profile(user)`, `list_network_statuses(profile)`
+- **API endpoints** (`/api/v1/agents/`):
+  - `GET /master/me` — own master profile (IsMasterAgent)
+  - `PATCH /master/me` — update business_name, profile_photo, etc.
+  - `GET /minor/me` — own minor profile (IsMinorAgent)
+  - `PATCH /minor/me` — update display_name
+  - `GET /master/network-status` — list network statuses
+  - `POST /master/network-status` — create/update network status
+- Tests: uniqueness constraints, PROTECT on delete, role validation, coordinate storage, signal-based auto-creation, API permission checks
+
+### Total Test Count: **113 tests** — all passing
 
 ---
 
-## How to Run the Project
+## API Endpoints — Complete Reference
 
-### Prerequisites
-- Python 3.12+
-- PostgreSQL (for development) or SQLite (for testing)
-- Redis (for caching + Celery — optional for local dev)
-- Docker (optional, for containerized setup)
+| Method | Endpoint                              | Auth Required | Permission        | Description                               |
+|--------|---------------------------------------|---------------|-------------------|-------------------------------------------|
+| POST   | `/api/v1/auth/register`               | No            | —                 | Register new user (phone, password)       |
+| POST   | `/api/v1/auth/login`                  | No            | —                 | Obtain JWT access + refresh tokens        |
+| POST   | `/api/v1/auth/login/refresh`          | No            | —                 | Refresh an expired access token           |
+| GET    | `/api/v1/auth/me`                     | Yes           | IsAuthenticated   | Current authenticated user profile        |
+| GET    | `/api/v1/networks/`                   | No (public)   | AllowAny          | List active networks (cached 15m)         |
+| GET    | `/api/v1/agents/master/me`            | Yes           | IsMasterAgent     | Own master agent profile                  |
+| PATCH  | `/api/v1/agents/master/me`            | Yes           | IsMasterAgent     | Update master agent profile               |
+| GET    | `/api/v1/agents/minor/me`             | Yes           | IsMinorAgent      | Own minor agent profile                   |
+| PATCH  | `/api/v1/agents/minor/me`             | Yes           | IsMinorAgent      | Update minor agent profile                |
+| GET    | `/api/v1/agents/master/network-status`| Yes           | IsMasterAgent     | List network statuses                     |
+| POST   | `/api/v1/agents/master/network-status`| Yes           | IsMasterAgent     | Create/update network status              |
+| GET    | `/admin/`                             | Admin         | Admin user        | Django admin interface                    |
 
-### Local Setup (No Docker)
-
-```bash
-# 1. Clone & enter the project
-git clone <repo-url> wakala-connect
-cd wakala-connect
-
-# 2. Create virtual environment
-python -m venv .venv
-.venv\Scripts\activate     # Windows
-# source .venv/bin/activate  # Linux/Mac
-
-# 3. Install dependencies
-pip install -r requirements/development.txt
-pip install -r requirements/testing.txt
-
-# 4. Configure environment
-cp .env.example .env
-# Edit .env — at minimum set DJANGO_SECRET_KEY and DATABASE_URL
-
-# 5. Apply migrations
-python manage.py migrate
-
-# 6. Run the development server
-python manage.py runserver
-
-# 7. Visit http://localhost:8000
-```
-
-### Docker Setup
+### Quick-Start Examples
 
 ```bash
-# 1. Build and start containers
-docker-compose up --build
+# Register a master agent
+curl -X POST http://localhost:8000/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"phone": "+255712000001", "password": "mypass123", "role": "MASTER_AGENT"}'
 
-# 2. Apply migrations
-docker-compose exec web python manage.py migrate
+# Login
+curl -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"phone": "+255712000001", "password": "mypass123"}'
 
-# 3. Visit http://localhost:8000
+# Use the returned access_token in subsequent requests:
+TOKEN="<access_token>"
+
+# Get master profile
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/agents/master/me
+
+# Update business name
+curl -X PATCH http://localhost:8000/api/v1/agents/master/me \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"business_name": "My Shop"}'
+
+# Toggle network status (requires a seeded network UUID)
+curl -X POST http://localhost:8000/api/v1/agents/master/network-status \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"network_id": "<network-uuid>", "is_active": true}'
+
+# List networks (public)
+curl http://localhost:8000/api/v1/networks/
 ```
-
-The `docker-compose.yml` includes:
-- `web` — Django application (gunicorn)
-- `db` — PostgreSQL
-- `redis` — Redis cache/broker
-- `celery_worker` — Celery worker
 
 ---
 
 ## How to Run Tests
 
-### All Tests
-
 ```bash
-# Using pytest directly
+# All tests (113 total)
 python -m pytest
 
-# With verbose output
-python -m pytest -v
+# By app
+python -m pytest common/tests/
+python -m pytest apps/accounts/tests/
+python -m pytest apps/networks/tests/
+python -m pytest apps/geo/tests/
+python -m pytest apps/agents/tests/
+
+# Specific test files
+python -m pytest apps/agents/tests/test_api.py
+python -m pytest apps/geo/tests/test_services.py
+python -m pytest apps/agents/tests/test_signals_or_wiring.py
 
 # With short traceback (cleaner failures)
 python -m pytest --tb=short
 
-# Quiet mode (just pass/fail counts)
-python -m pytest -q
-```
-
-### Run Tests by App
-
-```bash
-# Common app tests
-python -m pytest common/tests/
-
-# Accounts app tests
-python -m pytest apps/accounts/tests/
-
-# Networks app tests
-python -m pytest apps/networks/tests/
-
-# Settings/environment tests
-python -m pytest tests/
-```
-
-### Run Specific Test Files
-
-```bash
-python -m pytest apps/networks/tests/test_api.py
-python -m pytest common/tests/test_permissions.py
-```
-
-### Run Specific Tests
-
-```bash
-# By test class
-python -m pytest apps/accounts/tests/test_api.py::TestRegister
-
-# By individual test
-python -m pytest apps/networks/tests/test_api.py::TestNetworkList::test_returns_all_seeded_networks
-```
-
-### Run Linter
-
-```bash
+# Linter
 python -m ruff check .
-```
-
----
-
-## API Endpoints
-
-| Method | Endpoint                    | Auth Required | Description                        |
-|--------|-----------------------------|---------------|------------------------------------|
-| POST   | `/api/v1/auth/register`     | No            | Register new user (phone, password)|
-| POST   | `/api/v1/auth/login`        | No            | Obtain JWT access + refresh tokens |
-| POST   | `/api/v1/auth/login/refresh`| No            | Refresh an expired access token    |
-| GET    | `/api/v1/auth/me`           | Yes           | Current authenticated user profile |
-| GET    | `/api/v1/networks/`         | No (public)   | List active networks (cached 15m)  |
-| GET    | `/admin/`                   | Admin         | Django admin interface             |
-
-### Example: Register a user
-
-```bash
-curl -X POST http://localhost:8000/api/v1/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"phone": "+255712000001", "password": "mypass123", "role": "MASTER_AGENT"}'
-```
-
-### Example: Login
-
-```bash
-curl -X POST http://localhost:8000/api/v1/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"phone": "+255712000001", "password": "mypass123"}'
-```
-
-### Example: List networks (public)
-
-```bash
-curl http://localhost:8000/api/v1/networks/
 ```
 
 ---
@@ -214,78 +189,48 @@ curl http://localhost:8000/api/v1/networks/
 
 ```
 wakala-connect/
-├── api/
-│   └── v1/
-│       └── urls.py              # Top-level API v1 URL routing
+├── api/v1/urls.py              # Top-level API routing
 ├── apps/
-│   ├── accounts/
-│   │   ├── api/v1/views.py, serializers.py, urls.py
-│   │   ├── migrations/
-│   │   ├── tests/
-│   │   │   ├── factories.py     # UserFactory (reusable by all apps)
-│   │   │   ├── test_api.py
-│   │   │   ├── test_models.py
-│   │   │   └── test_services.py
-│   │   ├── admin.py
-│   │   ├── apps.py
-│   │   ├── managers.py
-│   │   ├── models.py
-│   │   ├── services.py
-│   │   └── validators.py
-│   └── networks/
-│       ├── api/v1/views.py, serializers.py, urls.py
-│       ├── migrations/
-│       │   ├── 0001_initial.py
-│       │   └── 0002_seed_networks.py  # Seeds 7 networks
-│       ├── tests/
-│       │   ├── test_models.py
-│       │   └── test_api.py
-│       ├── admin.py
-│       ├── apps.py
-│       └── models.py
-├── common/
-│   ├── tests/
-│   │   ├── test_exceptions.py
-│   │   ├── test_pagination.py
-│   │   └── test_permissions.py
-│   ├── constants.py
-│   ├── exceptions.py
-│   ├── mixins.py
-│   ├── models.py              # BaseModel, TimestampedMixin, etc.
-│   ├── pagination.py
-│   ├── permissions.py          # IsMasterAgent, IsMinorAgent, IsAdminRole, IsOwnerOrReadOnly
-│   ├── utils.py
-│   └── validators.py
-├── config/
-│   ├── settings/
-│   │   ├── base.py
-│   │   ├── development.py
-│   │   ├── testing.py
-│   │   └── production.py
-│   └── urls.py
-├── docs/
-│   └── architecture.md         # RBAC matrix
+│   ├── accounts/               # Auth & user management (Phase 4)
+│   ├── agents/                 # Business profiles & network status (Phase 8)
+│   │   ├── api/v1/             # Serializers, views, urls
+│   │   ├── admin.py            # All 3 models registered
+│   │   ├── apps.py             # AppConfig + signal registration
+│   │   ├── models.py           # MasterAgentProfile, MinorAgentProfile, AgentNetworkStatus
+│   │   ├── selectors.py        # Profile/status retrieval
+│   │   ├── services.py         # Profile creation, location, network status
+│   │   ├── signals.py          # Auto-create profile on User post_save
+│   │   └── tests/
+│   ├── geo/                    # Internal geolocation (Phase 7)
+│   │   ├── models.py           # GeoLocatedModel (abstract)
+│   │   ├── services.py         # Distance calculations via geopy
+│   │   ├── selectors.py        # nearby() queryset helper (haversine)
+│   │   ├── utils.py            # Coordinate validation
+│   │   └── tests/
+│   └── networks/               # Reference data (Phase 6)
+├── common/                     # Shared utils, models, permissions
+├── config/                     # Django settings (base/development/testing/production)
+├── docs/architecture.md        # RBAC matrix
 ├── requirements/
-│   ├── base.txt
-│   ├── development.txt
-│   ├── production.txt
-│   └── testing.txt
-├── tests/
-│   └── test_settings.py
+├── tests/                      # Environment/settings tests
 ├── docker-compose.yml
-├── manage.py
-├── pyproject.toml
-└── my_test1.md                 # This file
+└── manage.py
 ```
 
 ---
 
 ## Key Design Decisions
 
-1. **Integer PK on User model** — `AbstractUser` is tightly coupled to integer PKs across Django's auth infrastructure; switching to UUID would require extensive patching with no practical benefit at current scale.
+1. **Integer PK on User** — `AbstractUser` is tightly coupled to integer PKs across Django's auth infrastructure; switching to UUID would require extensive patching with no practical benefit at current scale.
 
-2. **URLField for network logo** — Avoids file upload, storage configuration, and serving complexity for MVP. Can be upgraded to ImageField when file uploads are required.
+2. **URLField for media** — Profile photos and network logos use URLField instead of ImageField to avoid file upload, storage configuration, and serving complexity for MVP.
 
 3. **Seed data via migration (RunPython)** — More reliable than raw fixture files; executes within the migration transaction and has a reversible function.
 
-4. **Public networks endpoint** — Network reference data is intentionally public (no auth required). Cached for 15 minutes via `@cache_page` decorator.
+4. **FloatField for coordinates (not PointField)** — GDAL is not guaranteed in all environments (CI, local dev). The FloatField + geopy approach works everywhere; production with PostGIS can add a computed Point column.
+
+5. **geopy for distance calculations** — Pure Python, no database dependency, testable in isolation.
+
+6. **Signal-based profile auto-creation** — `post_save` on User creates the appropriate `MasterAgentProfile` or `MinorAgentProfile`. A direct service call from `accounts.services.register_user` was avoided because accounts is more foundational than agents (would create circular import). The tradeoff is documented in a code comment.
+
+7. **Haversine via ORM expressions** — The `nearby()` selector implements the haversine formula using Django's `Sin`, `Cos`, `ASin`, `Sqrt` database functions, working on both SQLite and PostgreSQL without PostGIS-specific extensions.

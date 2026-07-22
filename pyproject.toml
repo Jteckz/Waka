@@ -35,7 +35,7 @@ preview = true
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "config.settings.testing"
 python_files = ["test_*.py", "*_test.py"]
-testpaths = ["tests", "common/tests", "apps/accounts/tests", "apps/networks/tests"]
+testpaths = ["tests", "common/tests", "apps/accounts/tests", "apps/networks/tests", "apps/geo/tests", "apps/agents/tests"]
 
 [tool.django]
 settings = "config.settings.development"
